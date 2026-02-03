@@ -28,10 +28,11 @@ _to = os.environ.get("STOCK_NEWS_TO_EMAIL", "gourmetlee0324@gmail.com,grandsaga@
 TO_EMAILS = [e.strip() for e in _to.split(",") if e.strip()]
 
 # Gmail SMTP (발신자: youngmin060324@gmail.com)
-SMTP_HOST = os.environ.get("STOCK_NEWS_SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("STOCK_NEWS_SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("STOCK_NEWS_SMTP_USER", "")
-SMTP_PASS = os.environ.get("STOCK_NEWS_SMTP_PASS", "")   # Gmail 앱 비밀번호 (stock_news_email_bot.ps1에서 설정)
+SMTP_HOST = (os.environ.get("STOCK_NEWS_SMTP_HOST") or "smtp.gmail.com").strip()
+_port = (os.environ.get("STOCK_NEWS_SMTP_PORT") or "587").strip()
+SMTP_PORT = int(_port) if _port else 587
+SMTP_USER = (os.environ.get("STOCK_NEWS_SMTP_USER") or "").strip()
+SMTP_PASS = (os.environ.get("STOCK_NEWS_SMTP_PASS") or "").strip()
 
 # 한국어 경제·증시 뉴스 RSS
 RSS_FEEDS = [
