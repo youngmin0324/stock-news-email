@@ -1,31 +1,209 @@
-# 매일 한국 시간 오전 8시에 주식 뉴스 이메일 발송
-# GitHub 서버(UTC)에서 실행되므로 cron은 UTC 기준
+# -*- coding: utf-8 -*-
+"""
+매일 아침 코스피·나스닥 관련 한국어 경제(주식) 뉴스를 수집해 이메일로 발송합니다.
+- 실행: python stock_news_email.py
+- 예약: GitHub Actions (매일 08:00 KST)
+"""
 
-name: Send Stock News Email
+import os
+import sys
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from urllib.parse import quote, urlparse
+import re
+import json
 
-on:
-  schedule:
-    # 한국 시간 08:00 = UTC 23:00 (전날) → 매일 23:00 UTC 실행
-    - cron: '0 23 * * *'
-  workflow_dispatch:  # 수동 실행 (Actions 탭에서 Run workflow)
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
 
-jobs:
-  send-email:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+_to = os.environ.get("STOCK_NEWS_TO_EMAIL", "gourmetlee0324@gmail.com,grandsaga@naver.com")
+TO_EMAILS = [e.strip() for e in _to.split(",") if e.strip()]
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+SMTP_HOST = (os.environ.get("STOCK_NEWS_SMTP_HOST") or "smtp.gmail.com").strip()
+_port = (os.environ.get("STOCK_NEWS_SMTP_PORT") or "587").strip()
+SMTP_PORT = int(_port) if _port else 587
+SMTP_USER = (os.environ.get("STOCK_NEWS_SMTP_USER") or "").strip()
+SMTP_PASS = (os.environ.get("STOCK_NEWS_SMTP_PASS") or "").strip()
 
-      - name: Run stock news email
-        env:
-          STOCK_NEWS_TO_EMAIL: ${{ secrets.STOCK_NEWS_TO_EMAIL }}
-          STOCK_NEWS_SMTP_HOST: ${{ secrets.STOCK_NEWS_SMTP_HOST }}
-          STOCK_NEWS_SMTP_PORT: ${{ secrets.STOCK_NEWS_SMTP_PORT }}
-          STOCK_NEWS_SMTP_USER: ${{ secrets.STOCK_NEWS_SMTP_USER }}
-          STOCK_NEWS_SMTP_PASS: ${{ secrets.STOCK_NEWS_SMTP_PASS }}
-        run: python stock_news_email.py
+RSS_FEEDS = [
+    ("연합뉴스 경제", "https://www.yna.co.kr/rss/economy.xml"),
+    ("연합뉴스 마켓+ (증시)", "https://www.yna.co.kr/rss/market.xml"),
+    ("연합뉴스 산업", "https://www.yna.co.kr/rss/industry.xml"),
+]
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+MAX_ITEMS_PER_FEED = 3
+
+MARKET_INDICES = [("KOSPI", "^KS11"), ("KOSDAQ", "^KQ11"), ("NASDAQ", "^IXIC")]
+
+
+def fetch_market_summary() -> list:
+    import urllib.request
+    result = []
+    for name, symbol in MARKET_INDICES:
+        try:
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/%s?interval=1d&range=5d" % quote(symbol, safe="")
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            chart = data.get("chart", {}).get("result")
+            if not chart:
+                continue
+            meta = chart[0].get("meta", {})
+            price = meta.get("regularMarketPrice")
+            prev = meta.get("previousClose") or meta.get("chartPreviousClose")
+            if price is None and chart[0].get("indicators", {}).get("quote"):
+                quotes = chart[0]["indicators"]["quote"][0]
+                closes = quotes.get("close")
+                if closes:
+                    price = next((c for c in reversed(closes) if c is not None), None)
+                    if prev is None and len(closes) > 1:
+                        prev = next((c for c in reversed(closes[:-1]) if c is not None), None)
+            if price is None:
+                continue
+            prev = prev or price
+            ch = (price - prev) if prev else 0
+            ch_pct = (ch / prev * 100) if prev and prev != 0 else 0
+            result.append({"name": name, "price": round(price, 2), "change": round(ch, 2), "change_pct": round(ch_pct, 2)})
+        except Exception as e:
+            print("증시 조회 실패 %s: %s" % (symbol, e), file=sys.stderr)
+    return result
+
+
+def fetch_rss(url: str) -> list:
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        print("RSS 요청 실패 %s: %s" % (url[:60], e), file=sys.stderr)
+        return []
+    items = []
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(data)
+        channel = root.find("channel") or root
+        for item in channel.findall("item")[:MAX_ITEMS_PER_FEED]:
+            title_el, link_el, desc_el, pub_el, source_el = item.find("title"), item.find("link"), item.find("description"), item.find("pubDate"), item.find("source")
+            title = (title_el.text or "").strip() if title_el is not None else ""
+            link = (link_el.text or "").strip() if link_el is not None else ""
+            desc = (desc_el.text or "").strip() if desc_el is not None else ""
+            pub = (pub_el.text or "").strip() if pub_el is not None else ""
+            source = (source_el.text or "").strip() if source_el is not None and (source_el.text or "").strip() else ""
+            if not source and link:
+                try:
+                    netloc = urlparse(link).netloc or ""
+                    source = netloc.replace("www.", "") if netloc else "연합뉴스"
+                except Exception:
+                    source = "연합뉴스"
+            if not source:
+                source = "연합뉴스"
+            if title or link:
+                items.append({"title": title, "link": link, "description": desc, "pubDate": pub, "source": source})
+    except Exception as e:
+        print("RSS 파싱 실패: %s" % e, file=sys.stderr)
+    return items
+
+
+def build_html_mail(to_email: str) -> tuple:
+    lines = []
+    today = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines.append("<h2>주식 뉴스 브리핑 (%s)</h2>" % today)
+    lines.append("<p>코스피·나스닥 관련 한국어 경제·증시 뉴스입니다.</p>")
+    market = fetch_market_summary()
+    if market:
+        lines.append("<h3>오늘의 증시</h3>")
+        lines.append("<table style='border-collapse:collapse; margin-bottom:1.2em; font-size:0.95em;'>")
+        lines.append("  <tr style='background:#f5f5f5;'><th style='padding:6px 12px; text-align:left; border:1px solid #ddd;'>지수</th><th style='padding:6px 12px; text-align:right; border:1px solid #ddd;'>종가</th><th style='padding:6px 12px; text-align:right; border:1px solid #ddd;'>등락</th></tr>")
+        for m in market:
+            ch, ch_pct = m["change"], m["change_pct"]
+            ch_str = "%+.2f (%+.2f%%)" % (ch, ch_pct) if ch is not None and ch_pct is not None else "-"
+            ch_color = "#c00" if ch and ch < 0 else "#08a" if ch and ch > 0 else "#666"
+            price_str = "%.2f" % m["price"] if isinstance(m["price"], float) else str(m["price"])
+            lines.append("  <tr><td style='padding:6px 12px; border:1px solid #ddd;'>%s</td><td style='padding:6px 12px; text-align:right; border:1px solid #ddd;'>%s</td><td style='padding:6px 12px; text-align:right; border:1px solid #ddd; color:%s;'>%s</td></tr>" % (m["name"], price_str, ch_color, ch_str))
+        lines.append("</table>")
+        lines.append("<p><small style='color:#666;'>기준: Yahoo Finance</small></p>")
+    else:
+        lines.append("<p><em>오늘의 증시 데이터를 불러오지 못했습니다.</em></p>")
+    for feed_name, url in RSS_FEEDS:
+        items = fetch_rss(url)
+        lines.append("<h3>%s</h3>" % feed_name)
+        if not items:
+            lines.append("<p><em>뉴스를 불러오지 못했습니다.</em></p>")
+            continue
+        lines.append("<ul style='list-style:none; padding-left:0;'>")
+        for n in items:
+            title = n["title"].replace("<", "&lt;").replace(">", "&gt;")
+            link, pub = n["link"], n["pubDate"]
+            desc = (n.get("description") or "").strip()
+            source = (n.get("source") or "연합뉴스").replace("<", "&lt;").replace(">", "&gt;")
+            if desc:
+                desc = re.sub(r"<[^>]+>", " ", desc)
+                desc = " ".join(desc.split())
+                if len(desc) > 200:
+                    desc = desc[:197] + "..."
+                desc = desc.replace("<", "&lt;").replace(">", "&gt;")
+            lines.append("<li style='margin-bottom:1em; padding-bottom:1em; border-bottom:1px solid #eee;'>")
+            lines.append('  <strong><a href="%s">%s</a></strong>' % (link, title or "(제목 없음)"))
+            if desc:
+                lines.append("  <p style='margin:0.35em 0 0.25em 0; font-size:0.9em; color:#444;'>%s</p>" % desc)
+            if pub:
+                lines.append("  <small style='color:#666;'>%s</small>" % pub.replace("<", "&lt;").replace(">", "&gt;"))
+            lines.append('  <small style="color:#888;"> · 출처: %s</small></li>' % source)
+        lines.append("</ul>")
+    lines.append("<hr><p><small>자동 발송 · 연합뉴스 RSS</small></p>")
+    html_body = "\n".join(lines)
+    subject = "[주식 뉴스] 코스피·증시 한국어 브리핑 %s" % datetime.now().strftime("%Y-%m-%d")
+    return subject, html_body
+
+
+def html_to_plain(html_body: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", html_body, flags=re.I)
+    text = re.sub(r"</(p|div|tr|li|h[1-6])>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r" +", " ", text).strip()
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def send_email(to_email: str, subject: str, html_body: str) -> bool:
+    if not SMTP_USER or not SMTP_PASS:
+        print("STOCK_NEWS_SMTP_USER, STOCK_NEWS_SMTP_PASS 환경 변수를 설정하세요.", file=sys.stderr)
+        return False
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = to_email
+    msg["Importance"] = "high"
+    msg["X-Priority"] = "1"
+    msg.attach(MIMEText(html_to_plain(html_body), "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    try:
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls(context=ctx)
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, to_email, msg.as_string())
+        print("이메일 발송 완료: %s" % to_email)
+        return True
+    except Exception as e:
+        print("이메일 발송 실패: %s" % e, file=sys.stderr)
+        return False
+
+
+def main():
+    subject, html_body = build_html_mail(TO_EMAILS[0] if TO_EMAILS else "")
+    ok_all = True
+    for to in TO_EMAILS:
+        if not send_email(to, subject, html_body):
+            ok_all = False
+    sys.exit(0 if ok_all else 1)
+
+
+if __name__ == "__main__":
+    main()
